@@ -1,0 +1,366 @@
+# Nav2 parameters for the ERC 2026 TIAGo Pro solution.
+#
+# Derived from the stock Nav2 TurtleBot3 example, with every TurtleBot3
+# assumption replaced by a value measured from tiago_pro.urdf, the sensor
+# table in tiago_pro_limits.pdf, or the actual bridged topic list.
+#
+# WHAT CHANGED AND WHY (the four that actually mattered):
+#
+#   1. FOOTPRINT.  base_link's collision box is 0.717 x 0.497 m, giving an
+#      inscribed radius of 0.249 m and a circumscribed radius of 0.436 m.
+#      The old robot_radius: 0.22 was the TurtleBot3 value - roughly half
+#      the real robot on the diagonal - so the planner was routing paths
+#      that clip the shelf.  A polygon is used rather than a radius because
+#      the base is noticeably longer than it is wide.
+#
+#   2. SCAN TOPICS.  Nothing publishes /scan.  The ros_gz_bridge publishes
+#      /scan_front_raw and /scan_rear_raw.  Both costmaps were subscribed
+#      to a topic with no publisher, so the obstacle layers had never
+#      received a single laser return.  Both lasers are used now, so the
+#      robot is not blind behind itself during a Nav2 backup recovery.
+#
+#   3. OMNI MOTION.  The base is a mecanum drive.  AMCL was using the
+#      differential motion model, which has no noise term for lateral
+#      motion, so every strafe corrupted the particle filter.  DWB and the
+#      velocity smoother were independently zeroing y velocity in three
+#      places (acc_lim_y, min_y_velocity_threshold, and the smoother's
+#      max_velocity), so the omni base was being driven as a differential
+#      one.
+#
+#   4. GOAL TOLERANCE.  Tightened, because the approach stage parks close
+#      to the shelf: at the old 0.25 m tolerance Nav2 could legitimately
+#      declare success with the base only a few centimetres off the shelf
+#      face.  approach_column.py then does a closed-loop alignment on top
+#      of this to reach ~2 cm and ~0.5 deg.
+
+amcl:
+  ros__parameters:
+    use_sim_time: True
+    alpha1: 0.2          # rotation noise from rotation
+    alpha2: 0.2          # rotation noise from translation
+    alpha3: 0.2          # translation noise from translation
+    alpha4: 0.2          # translation noise from rotation
+    alpha5: 0.2          # strafe noise - only used by the omni model
+    base_frame_id: "base_footprint"
+    global_frame_id: "map"
+    odom_frame_id: "odom"
+    # Mecanum base: the differential model cannot represent lateral motion
+    # at all, and this robot strafes during both drift-hold and final
+    # alignment.
+    robot_model_type: "nav2_amcl::OmniMotionModel"
+    scan_topic: /scan_front_raw
+    laser_model_type: "likelihood_field"
+    laser_likelihood_max_dist: 2.0
+    laser_max_range: 25.0        # SICK TIM551 per the datasheet, not 100.0
+    laser_min_range: 0.05
+    max_beams: 120               # 818 samples available; 120 is plenty
+    max_particles: 2000
+    min_particles: 500
+    pf_err: 0.05
+    pf_z: 0.99
+    # Non-zero so AMCL can inject random particles and recover from a bad
+    # convergence instead of staying confidently wrong.
+    recovery_alpha_fast: 0.1
+    recovery_alpha_slow: 0.001
+    resample_interval: 1
+    save_pose_rate: 0.5
+    sigma_hit: 0.2
+    lambda_short: 0.1
+    beam_skip_distance: 0.5
+    beam_skip_error_threshold: 0.9
+    beam_skip_threshold: 0.3
+    do_beamskip: false
+    tf_broadcast: true
+    transform_tolerance: 1.0
+    update_min_a: 0.1
+    update_min_d: 0.15
+    z_hit: 0.5
+    z_max: 0.05
+    z_rand: 0.5
+    z_short: 0.05
+    # set_initial_pose is left false on purpose: set_initial_pose.py
+    # publishes /initialpose from the known spawn pose and then waits for
+    # the covariance to come down, which also tells us whether it worked.
+    set_initial_pose: false
+
+bt_navigator:
+  ros__parameters:
+    use_sim_time: True
+    global_frame: map
+    robot_base_frame: base_link
+    odom_topic: /odom
+    bt_loop_duration: 10
+    default_server_timeout: 20
+    wait_for_service_timeout: 1000
+
+bt_navigator_navigate_through_poses_rclcpp_node:
+  ros__parameters:
+    use_sim_time: True
+
+bt_navigator_navigate_to_pose_rclcpp_node:
+  ros__parameters:
+    use_sim_time: True
+
+controller_server:
+  ros__parameters:
+    use_sim_time: True
+    # Was 20.0. The first run logged "Control loop missed its desired rate of
+    # 20.0000Hz" and "Planner loop missed its desired rate" - DWB was not
+    # finishing a cycle in time inside the container, so the base received
+    # stale or absent commands and crawled. 10 Hz with fewer samples (below)
+    # is a cycle this machine can actually complete.
+    controller_frequency: 10.0
+    min_x_velocity_threshold: 0.001
+    # Was 0.5, which silently discarded every lateral command the planner
+    # produced, since max_speed_xy is well below it.
+    min_y_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      movement_time_allowance: 10.0
+
+    general_goal_checker:
+      stateful: True
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.08
+      yaw_goal_tolerance: 0.05
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: True
+      min_vel_x: 0.0
+      max_vel_x: 0.5
+      min_vel_y: -0.4
+      max_vel_y: 0.4
+      max_vel_theta: 1.0
+      min_speed_xy: 0.0
+      max_speed_xy: 0.5          # the base is rated to 1.0 m/s; 0.26 was a TB3 cap
+      min_speed_theta: 0.0
+      acc_lim_x: 2.5
+      acc_lim_y: 2.5             # was 0.0, which made y velocity unreachable
+      acc_lim_theta: 3.2
+      decel_lim_x: -2.5
+      decel_lim_y: -2.5
+      decel_lim_theta: -3.2
+      # 20 x 10 x 20 = 4000 trajectories per cycle was more than the
+      # container could evaluate at rate. 10 x 5 x 10 = 500 is a quarter of
+      # the resolution and an eighth of the cost, and the arena between the
+      # start zone and the shelf is empty, so fine trajectory resolution
+      # buys very little here.
+      vx_samples: 10
+      vy_samples: 5
+      vtheta_samples: 10
+      sim_time: 1.7
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      xy_goal_tolerance: 0.08
+      trans_stopped_velocity: 0.25
+      short_circuit_trajectory_evaluation: True
+      stateful: True
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign",
+                "PathAlign", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.05
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.1
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.1
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: True
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 4                   # the robot itself is 0.72 m long; 3 m was tight
+      height: 4
+      resolution: 0.05
+      # Measured from base_link's collision box (0.717 x 0.497 m).
+      footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
+      footprint_padding: 0.02
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan_front scan_rear
+        scan_front:
+          topic: /scan_front_raw
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+        scan_rear:
+          topic: /scan_rear_raw
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 5.0
+        # Must clear the inscribed radius (0.249 m) but stay small enough
+        # that the parked pose in front of the shelf is still cheap to plan
+        # into. At 0.30 the goal sat right on the inflation boundary.
+        inflation_radius: 0.28
+      always_send_full_costmap: True
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      use_sim_time: True
+      update_frequency: 1.0
+      publish_frequency: 1.0
+      global_frame: map
+      robot_base_frame: base_link
+      resolution: 0.05
+      track_unknown_space: true
+      footprint: "[[0.36, 0.25], [0.36, -0.25], [-0.36, -0.25], [-0.36, 0.25]]"
+      footprint_padding: 0.02
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: scan_front scan_rear
+        scan_front:
+          topic: /scan_front_raw
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+        scan_rear:
+          topic: /scan_rear_raw
+          max_obstacle_height: 2.0
+          clearing: True
+          marking: True
+          data_type: "LaserScan"
+          raytrace_max_range: 8.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.28
+      always_send_full_costmap: True
+
+map_server:
+  ros__parameters:
+    use_sim_time: True
+    yaml_filename: ""            # supplied by the launch file's `map` argument
+
+map_saver:
+  ros__parameters:
+    use_sim_time: True
+    save_map_timeout: 5.0
+    free_thresh_default: 0.25
+    occupied_thresh_default: 0.65
+    map_subscribe_transient_local: True
+
+planner_server:
+  ros__parameters:
+    use_sim_time: True
+    expected_planner_frequency: 20.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner/NavfnPlanner"
+      tolerance: 0.25
+      use_astar: false
+      # The SLAM map leaves a large fraction of the arena unknown, so
+      # forbidding unknown space would make some goals unreachable.
+      allow_unknown: true
+
+smoother_server:
+  ros__parameters:
+    use_sim_time: True
+    smoother_plugins: ["simple_smoother"]
+    simple_smoother:
+      plugin: "nav2_smoother::SimpleSmoother"
+      tolerance: 1.0e-10
+      max_its: 1000
+      do_refinement: True
+
+behavior_server:
+  ros__parameters:
+    use_sim_time: True
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
+    spin:
+      plugin: "nav2_behaviors/Spin"
+    backup:
+      plugin: "nav2_behaviors/BackUp"
+    drive_on_heading:
+      plugin: "nav2_behaviors/DriveOnHeading"
+    wait:
+      plugin: "nav2_behaviors/Wait"
+    assisted_teleop:
+      plugin: "nav2_behaviors/AssistedTeleop"
+    global_frame: odom
+    robot_base_frame: base_link
+    transform_tolerance: 0.1
+    simulate_ahead_time: 2.0
+    max_rotational_vel: 1.0
+    min_rotational_vel: 0.4
+    rotational_acc_lim: 3.2
+
+robot_state_publisher:
+  ros__parameters:
+    use_sim_time: True
+
+waypoint_follower:
+  ros__parameters:
+    use_sim_time: True
+    loop_rate: 20
+    stop_on_failure: false
+    waypoint_task_executor_plugin: "wait_at_waypoint"
+    wait_at_waypoint:
+      plugin: "nav2_waypoint_follower::WaitAtWaypoint"
+      enabled: True
+      waypoint_pause_duration: 200
+
+velocity_smoother:
+  ros__parameters:
+    use_sim_time: True
+    smoothing_frequency: 20.0
+    scale_velocities: False
+    feedback: "OPEN_LOOP"
+    # y was capped at 0.0 here, which threw away lateral commands even
+    # after DWB was fixed to produce them.
+    max_velocity: [0.5, 0.4, 1.0]
+    min_velocity: [-0.5, -0.4, -1.0]
+    max_accel: [2.5, 2.5, 3.2]
+    max_decel: [-2.5, -2.5, -3.2]
+    odom_topic: "odom"
+    odom_duration: 0.1
+    deadband_velocity: [0.0, 0.0, 0.0]
+    velocity_timeout: 1.0
