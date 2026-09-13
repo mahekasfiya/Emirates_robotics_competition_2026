@@ -15,6 +15,26 @@ Grasp verification:
   signals are:
     finger joint close to 0  - pads fully shut
     contact=True             - pads touching a book's mesh
+
+Swing routing:
+  The tuck-to-staging move is a joint-space interpolation across ~4.3 rad
+  of arm travel. Interpolating that in one shot bulges the gripper forward
+  past the book face mid-move. The swing is split: tuck -> RETRACT (gripper
+  well behind the book face) -> staging.
+
+Entry step distribution:
+  Fine steps on the COMMIT, coarse on the creep to the checkpoint.
+
+Recovery:
+  Pull the arm straight back along the approach axis BEFORE folding to
+  tuck, so the fold happens in open air rather than sweeping through the
+  region where the book sits.
+
+Lateral aim:
+  The re-detect's Y is cross-checked against the far detection. When they
+  disagree by more than LATERAL_CROSSCHECK_M, the far detection's Y wins.
+  The disturb guard compares consecutive re-detects; threshold raised to
+  0.080 so AMCL drift (3-4 cm between attempts) doesn't false-trigger.
 """
 
 import json
@@ -53,6 +73,7 @@ COLOUR_RANGES = {
 }
 
 ARM_JOINTS = [f'arm_right_{i}_joint' for i in range(1, 8)]
+RIGHT_TUCK = [-0.3, -1.9, 0.3, -2.35, 0.0, 0.0, 0.0]
 
 
 def normalize_angle(a):
@@ -71,13 +92,28 @@ class GraspBook(Node):
     RETREAT_STANDOFF = 0.85
     SHOULDER_OFFSET = 0.159
     PAD_CENTRE_BEHIND_FRAME = 0.056
-    GRASP_DEPTH_INTO_BOOK = 0.13
-    PREGRASP_OFFSET = 0.10
+    GRASP_DEPTH_INTO_BOOK = 0.07
+    PREGRASP_OFFSET = 0.15
     STAGING_EXTRA = 0.15
+    TIP_BEHIND_FRAME = 0.027
+    # Empirical lateral trim, metres in base_footprint y (+ is the robot's
+    # LEFT). Use this only if a residual bias survives the depth-frame fix:
+    # the 'lateral residual' line logged at the hover checkpoint gives both
+    # the sign and the size. Positive shifts the gripper left, which is what
+    # you want if the RIGHT finger is the one catching the spine.
+    LATERAL_AIM_BIAS = 0.0
+    TIP_CLEARANCE = 0.020
+    POSTURE_LEASH = 2.6
     LIFT_HEIGHT = 0.03
     WITHDRAW = 0.22
     WITHDRAW_SEC = 2.5
     IK_RESTARTS = 30
+    RETRACT_BEHIND_BOOK = 0.35
+    RETRACT_BELOW_BOOK = 0.15
+    RECOVER_RETRACT_DISTANCE = 0.45
+    RECOVER_RETRACT_MIN_X = 0.15
+    ENTRY_STEPS_APPROACH = 2
+    ENTRY_STEPS_COMMIT = 6
 
     # --- Torso ------------------------------------------------------------
     SURVEY_TORSO = 0.25
@@ -97,19 +133,22 @@ class GraspBook(Node):
     BOOK_SPINE = 0.02
     GRIP_STALL_MAX = 0.015
     GRIP_HOLD_PERIOD = 0.5
-    GRIP_CLOSE_DURATION = 0.35
+    GRIP_CLOSE_DURATION = 0.9
     GRIP_CLOSE_TIMEOUT = 6.0
     GRIP_SETTLE_TOL = 0.0004
     GRIP_HOLD_DURATION = 0.08
-    BUMP_GUARD_ENABLED = False
+    BUMP_GUARD_ENABLED = True
 
     # --- Alignment --------------------------------------------------------
     XY_TOLERANCE = 0.020
     YAW_TOLERANCE = 0.010
     XY_ACCEPT = 0.050
-    FORWARD_ACCEPT = 0.045
-    LATERAL_ACCEPT = 0.060
+    FORWARD_ACCEPT = 0.050
+    LATERAL_ACCEPT = 0.040
     YAW_ACCEPT = 0.070
+    PROCEED_FWD = 0.070
+    PROCEED_LAT = 0.045
+    PROCEED_YAW = 0.090
     ALIGN_PATIENCE = 10.0
     KP_LINEAR = 1.2
     KP_ANGULAR = 1.5
@@ -121,11 +160,28 @@ class GraspBook(Node):
     MAX_CREEP = 0.75
 
     # --- Detection --------------------------------------------------------
-    MIN_CONTOUR_AREA = 500
+    MIN_CONTOUR_AREA = 250
     MAX_CONTOUR_AREA = 120000
     DETECT_SETTLE_SEC = 1.2
     DETECT_TIMEOUT_SEC = 6.0
     SEARCH_RADIUS = 0.25
+    REDETECT_FRAMES = 6
+    REDETECT_MIN_FRAMES = 3
+    REDETECT_MAX_SPREAD = 0.030
+    OUTLIER_REJECT = 0.030
+    DEPTH_ERODE = 2
+    BORDER_MARGIN = 3
+    MIN_BLOB_WIDTH_M = 0.008
+    MAX_BLOB_WIDTH_M = 0.110
+    # A book that has been genuinely knocked over shows up as a 10+ cm jump
+    # in the map-frame measurement. AMCL drift between attempts is 3-4 cm on
+    # this setup, which the previous 3 cm threshold was misreading as book
+    # motion. 8 cm is high enough to ignore AMCL drift, low enough to catch
+    # a real disturbance.
+    DISTURBED_THRESHOLD = 0.080
+    # Drift in the 4-8 cm range gets logged but does not abort.
+    DISTURBED_LOG = 0.040
+    LATERAL_CROSSCHECK_M = 0.025
 
     MAX_ATTEMPTS = 3
 
@@ -148,14 +204,15 @@ class GraspBook(Node):
         self.bridge = CvBridge()
         self.kin = None
         self.camera_matrix = None
+        self.depth_matrix = None
         self.joint_state = {}
         self.book_contact = False
         self.joint_effort = {}
         self.grip_hold_value = None
         self.last_failure = None
+        self.last_measured = None
         self.exit_code = 0
 
-        # Latest-frame cache
         self._latest_colour = None
         self._latest_depth = None
         self._colour_stamp = 0.0
@@ -183,6 +240,9 @@ class GraspBook(Node):
         self.create_subscription(CameraInfo,
                                  '/head_front_camera/head_front_camera/color/camera_info',
                                  self.info_cb, 10)
+        self.create_subscription(CameraInfo,
+                                 '/head_front_camera/head_front_camera/depth/camera_info',
+                                 self.depth_info_cb, 10)
         self.create_subscription(Contacts, '/contacts', self.contacts_cb, 10)
         self.create_subscription(
             Image, '/head_front_camera/head_front_camera/color/image_raw',
@@ -220,6 +280,10 @@ class GraspBook(Node):
     def info_cb(self, msg):
         if self.camera_matrix is None:
             self.camera_matrix = np.array(msg.k).reshape(3, 3)
+
+    def depth_info_cb(self, msg):
+        if self.depth_matrix is None:
+            self.depth_matrix = np.array(msg.k).reshape(3, 3)
 
     def contacts_cb(self, msg):
         for c in msg.contacts:
@@ -290,15 +354,100 @@ class GraspBook(Node):
             traj.points.append(pt)
         pub.publish(traj)
 
-    def move_arm(self, q_list, seconds_each=2.0, wait=True):
+    ARM_VEL_LIMIT = 1.95
+    ARM_VEL_MARGIN = 0.30
+
+    def leashed(self, bounds):
+        lo, hi = bounds
+        lo = np.array(lo, float).copy()
+        hi = np.array(hi, float).copy()
+        tuck = np.array(RIGHT_TUCK, float)
+        lo[1:] = np.maximum(lo[1:], tuck - self.POSTURE_LEASH)
+        hi[1:] = np.minimum(hi[1:], tuck + self.POSTURE_LEASH)
+        return lo, hi
+
+    def arm_move_time(self, q_target, minimum):
+        now = self.current_q()
+        travel = float(np.max(np.abs(np.asarray(q_target)[1:] - now[1:])))
+        needed = travel / (self.ARM_VEL_LIMIT * self.ARM_VEL_MARGIN)
+        return max(minimum, needed)
+
+    def arm_error(self, q_target):
+        now = self.current_q()
+        return float(np.max(np.abs(np.asarray(q_target)[1:] - now[1:])))
+
+    ARM_SETTLE_TOL = 0.020
+    ARM_SETTLE_STILL = 6
+    DROOP_CORRECTIONS = 8
+    DROOP_GAIN = 1.8
+    DROOP_FINAL_TOL = 0.012
+
+    def move_arm(self, q_list, seconds_each=2.0, wait=True, precise=False):
         pts = []
         t = 0.0
         for q in q_list:
             t += seconds_each
             pts.append((q[1:], t))
         self.send_traj(self.arm_pub, ARM_JOINTS, None, 0, extra_points=pts)
-        if wait:
-            self.sleep_sim(t + 0.6)
+        if not wait:
+            return True
+
+        target = np.asarray(q_list[-1])
+        if self._settle(target, t) or not q_list:
+            return True
+        if not precise and self.arm_error(target) < 0.08:
+            return True
+
+        if not precise:
+            return True
+        tol = self.DROOP_FINAL_TOL
+        rounds = self.DROOP_CORRECTIONS
+        bias = np.zeros(7)
+        best = self.arm_error(target)
+        for attempt in range(rounds):
+            actual = self.current_q()
+            err = target[1:] - actual[1:]
+            worst = float(np.max(np.abs(err)))
+            best = min(best, worst)
+            if worst < tol:
+                if attempt:
+                    self.get_logger().info(
+                        f'Arm converged to {worst:.3f} rad after {attempt} correction(s).')
+                return True
+            bias = np.clip(bias + self.DROOP_GAIN * err, -0.6, 0.6)
+            corrected = target.copy()
+            corrected[1:] = np.clip(target[1:] + bias,
+                                    self.kin.lower[1:], self.kin.upper[1:])
+            self.send_traj(self.arm_pub, ARM_JOINTS, None, 0,
+                           extra_points=[(corrected[1:], max(1.2, t * 0.35))])
+            self._settle(target, max(1.2, t * 0.35))
+        final = self.arm_error(target)
+        self.get_logger().warn(
+            f'Arm still {final:.3f} rad short after {rounds} droop corrections '
+            f'(best {best:.3f}).')
+        return False
+
+    def _settle(self, target, t):
+        start = self.sim_now()
+        budget = t * 1.5 + 5.0
+        cap = time.time() + budget * 40
+        last, still = None, 0
+        while time.time() < cap:
+            err = self.arm_error(target)
+            if err < self.ARM_SETTLE_TOL:
+                return True
+            now = self.current_q()[1:]
+            if last is not None and float(np.max(np.abs(now - last))) < 0.002:
+                still += 1
+                if still >= self.ARM_SETTLE_STILL and self.sim_now() - start > t * 0.4:
+                    return False
+            else:
+                still = 0
+            last = now
+            if self.sim_now() - start > budget:
+                return False
+            time.sleep(0.05)
+        return False
 
     def move_torso(self, value, wait=True):
         value = float(np.clip(value, -0.001, 0.35))
@@ -476,14 +625,42 @@ class GraspBook(Node):
                 f'(limit {self.LATERAL_ACCEPT * 100:.1f}), '
                 f'yaw {math.degrees(abs(normalize_angle(goal_yaw - pose[2]))):.2f} deg '
                 f'(limit {math.degrees(self.YAW_ACCEPT):.2f}).')
+            eyaw_abs = abs(normalize_angle(goal_yaw - pose[2]))
+            if (e_fwd <= self.PROCEED_FWD and e_lat <= self.PROCEED_LAT
+                    and eyaw_abs <= self.PROCEED_YAW):
+                self.get_logger().warn(
+                    f'Still within the workable band (fwd <= {self.PROCEED_FWD * 100:.0f} cm, '
+                    f'lat <= {self.PROCEED_LAT * 100:.0f} cm) - going ahead. The entry '
+                    'reaches further to compensate.')
+                return True
         return False
+
+    def dump_view(self, colour):
+        try:
+            if self._latest_colour is None:
+                return
+            img = self.bridge.imgmsg_to_cv2(self._latest_colour, 'bgr8')
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            mask = None
+            for lo, hi in COLOUR_RANGES[colour]:
+                part = cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
+                mask = part if mask is None else cv2.bitwise_or(mask, part)
+            overlay = img.copy()
+            overlay[mask > 0] = (0, 0, 255)
+            cv2.imwrite('/tmp/erc_grasp_view.png',
+                        np.hstack([img, cv2.addWeighted(img, 0.5, overlay, 0.5, 0)]))
+        except Exception as e:
+            self.get_logger().warn(f'Could not write the diagnostic view: {e}')
 
     def redetect_book(self, colour, expected_map_xyz):
         started = self.sim_now()
         wall_cap = time.time() + self.DETECT_TIMEOUT_SEC * 40
         best = None
+        samples = []
         last_stamp = None
         frames = 0
+        stats = {'contours': 0, 'biggest': 0.0, 'area': 0, 'border': 0, 'depth': 0,
+                 'width': 0, 'widths': [], 'tf': 0, 'radius': 0, 'nearest': 9.9}
         while self.sim_now() - started < self.DETECT_TIMEOUT_SEC and time.time() < wall_cap:
             if self._latest_colour is None or self._latest_depth is None:
                 time.sleep(0.05)
@@ -512,42 +689,110 @@ class GraspBook(Node):
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
             contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            stats['contours'] += len(contours)
             for cnt in contours:
                 area = cv2.contourArea(cnt)
+                stats['biggest'] = max(stats['biggest'], area)
                 if area < self.MIN_CONTOUR_AREA or area > self.MAX_CONTOUR_AREA:
+                    stats['area'] += 1
                     continue
                 x, y, w, h = cv2.boundingRect(cnt)
+                ih, iw = depth.shape[:2]
+                if (x <= self.BORDER_MARGIN or y <= self.BORDER_MARGIN
+                        or x + w >= iw - self.BORDER_MARGIN
+                        or y + h >= ih - self.BORDER_MARGIN):
+                    stats['border'] += 1
+                    continue
                 m = np.zeros(depth.shape[:2], np.uint8)
                 cv2.drawContours(m, [cnt], -1, 255, cv2.FILLED)
-                vals = depth[m > 0].astype(np.float32)
+                inner = cv2.erode(m, np.ones((self.DEPTH_ERODE * 2 + 1,) * 2, np.uint8))
+                src = inner if cv2.countNonZero(inner) >= 20 else m
+                vals = depth[src > 0].astype(np.float32)
                 vals = vals[np.isfinite(vals) & (vals > 0)]
                 if vals.size < 20:
+                    stats['depth'] += 1
                     continue
-                z = float(np.median(vals))
-                pos = self.pixel_to_map(cmsg.header, x + w // 2, y + h // 2, z)
+                z = float(np.percentile(vals, 30))
+                width_m = w * z / (self.depth_matrix if self.depth_matrix is not None
+                                   else self.camera_matrix)[0, 0]
+                if not self.MIN_BLOB_WIDTH_M <= width_m <= self.MAX_BLOB_WIDTH_M:
+                    stats['width'] += 1
+                    stats['widths'].append(round(width_m, 4))
+                    continue
+                mom = cv2.moments(cnt)
+                if mom['m00'] <= 0:
+                    continue
+                pos = self.pixel_to_map(dmsg.header, int(mom['m10'] / mom['m00']),
+                                        int(mom['m01'] / mom['m00']), z,
+                                        matrix=self.depth_matrix)
                 if pos is None:
+                    stats['tf'] += 1
                     continue
                 err = float(np.linalg.norm(pos - np.asarray(expected_map_xyz)))
+                stats['nearest'] = min(stats['nearest'], err)
                 if err > self.SEARCH_RADIUS:
+                    stats['radius'] += 1
                     continue
                 if best is None or err < best[1]:
                     best = (pos, err)
             if best is not None:
-                self.get_logger().info(
-                    f'Re-detected the {colour} book: '
-                    f'({best[0][0]:.3f}, {best[0][1]:.3f}, {best[0][2]:.3f}), '
-                    f'{best[1] * 100:.1f} cm from the estimate.')
-                return best[0]
+                samples.append(best[0])
+                best = None
+                if len(samples) >= self.REDETECT_FRAMES:
+                    break
             time.sleep(0.05)
 
+        if len(samples) >= self.REDETECT_MIN_FRAMES:
+            arr = np.array(samples)
+            med = np.median(arr, axis=0)
+            keep = arr[np.linalg.norm(arr - med, axis=1) <= self.OUTLIER_REJECT]
+            if len(keep) < self.REDETECT_MIN_FRAMES:
+                keep = arr
+            pos = np.median(keep, axis=0)
+            spread = float(np.max(np.linalg.norm(keep - pos, axis=1)))
+            err = float(np.linalg.norm(pos - np.asarray(expected_map_xyz)))
+            self.get_logger().info(
+                f'Re-detected the {colour} book over {len(keep)}/{len(samples)} frames: '
+                f'({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}), {err * 100:.1f} cm from the '
+                f'estimate, spread {spread * 100:.1f} cm.')
+            if spread > self.REDETECT_MAX_SPREAD:
+                self.get_logger().warn(
+                    f'Frames disagree by {spread * 100:.1f} cm, over the '
+                    f'{self.REDETECT_MAX_SPREAD * 100:.0f} cm limit. The jaws only clear '
+                    'the spine by about 3 cm a side, so entering on this would probably '
+                    'knock the book. Not entering.')
+                return None
+            return pos
+
+        near = ('n/a' if stats['nearest'] > 9 else f"{stats['nearest'] * 100:.0f} cm")
         self.get_logger().warn(
-            f'Could not re-detect the book in {frames} frames - using the detection-pose '
-            'estimate.')
+            f'Could not re-detect the {colour} book over {frames} frames. '
+            f'{stats["contours"]} contour(s) found, biggest {stats["biggest"]:.0f} px2. '
+            f'Rejected: area {stats["area"]}, border-clipped {stats["border"]}, '
+            f'depth {stats["depth"]}, width {stats["width"]} '
+            f'{stats["widths"][:4]}, TF {stats["tf"]}, too-far {stats["radius"]} '
+            f'(nearest {near}). Using the detection-pose estimate.')
+        if stats['contours'] == 0:
+            self.get_logger().warn(
+                f'Zero {colour} contours at all - the HSV window is not matching, or the '
+                'head is not pointing at the book. Check /tmp/erc_grasp_view.png.')
+        self.dump_view(colour)
         return None
 
-    def pixel_to_map(self, header, cx, cy, z):
-        fx, fy = self.camera_matrix[0, 0], self.camera_matrix[1, 1]
-        px, py = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
+    def pixel_to_map(self, header, cx, cy, z, matrix=None):
+        """Unproject a pixel to the map frame.
+
+        The range comes from the DEPTH image, so the ray must be the DEPTH
+        camera's - head_front_camera_color_frame sits 0.015 m to the side of
+        head_front_camera_depth_frame in the URDF. Using the colour ray with a
+        depth range mixes two cameras separated by that baseline and produces
+        a systematic ~1.5 cm lateral error, always the same direction. The
+        fingers only clear a 2 cm spine by about 3 cm a side, so a constant
+        1.5 cm bias is most of the margin.
+        """
+        K = self.camera_matrix if matrix is None else matrix
+        fx, fy = K[0, 0], K[1, 1]
+        px, py = K[0, 2], K[1, 2]
         pt = PointStamped()
         pt.header.frame_id = header.frame_id
         pt.header.stamp = RclTime().to_msg()
@@ -611,6 +856,10 @@ class GraspBook(Node):
             if self.last_failure == 'gripper':
                 self.get_logger().error('Gripper never opened - stopping.')
                 break
+            if self.last_failure == 'disturbed':
+                self.get_logger().error(
+                    'Book already disturbed - not attempting again.')
+                break
             self.recover_after_failure()
             if self.last_failure == 'ik':
                 standoff = max(self.MIN_STANDOFF, standoff - self.STANDOFF_SHRINK)
@@ -634,15 +883,57 @@ class GraspBook(Node):
         if base_pt is None:
             return False
         cam_h = 1.147 + self.SURVEY_TORSO
-        tilt = float(np.clip(math.atan2(base_pt[2] - cam_h,
-                                        max(0.2, base_pt[0])), -1.0, 0.34))
-        self.move_head(0.0, tilt)
+        pan = float(np.clip(math.atan2(base_pt[1], max(0.2, base_pt[0])),
+                            -1.25, 1.25))
+        horiz = max(0.2, math.hypot(base_pt[0], base_pt[1]))
+        tilt = float(np.clip(math.atan2(base_pt[2] - cam_h, horiz), -1.0, 0.34))
+        self.get_logger().info(
+            f'Aiming the head at the book: pan {math.degrees(pan):+.1f} deg, '
+            f'tilt {math.degrees(tilt):+.1f} deg.')
+        self.move_head(pan, tilt)
         self.sleep_sim(self.DETECT_SETTLE_SEC)
 
         refined = self.redetect_book(colour, book_xyz)
-        target_map = refined if refined is not None else book_xyz
-        base_pt = self.map_to_base(target_map)
-        if base_pt is None:
+        if refined is None:
+            self.get_logger().warn(
+                'No measurement good enough to aim the entry. Skipping this attempt '
+                'rather than entering blind.')
+            self.last_failure = 'measure'
+            return False
+
+        if self.last_measured is not None:
+            moved = float(np.linalg.norm(refined - self.last_measured))
+            if moved > self.DISTURBED_THRESHOLD:
+                self.get_logger().error(
+                    f'The book has shifted {moved * 100:.1f} cm since the last attempt '
+                    f'(threshold {self.DISTURBED_THRESHOLD * 100:.0f} cm) - the previous '
+                    'approach probably knocked it over. Stopping.')
+                self.last_failure = 'disturbed'
+                return False
+            if moved > self.DISTURBED_LOG:
+                self.get_logger().info(
+                    f'Re-detect drifted {moved * 100:.1f} cm since the last attempt - '
+                    'likely AMCL drift, not book motion. Continuing.')
+        self.last_measured = np.array(refined, float)
+
+        base_pt_far = self.map_to_base(book_xyz)
+        base_pt_re = self.map_to_base(refined)
+        if base_pt_far is not None and base_pt_re is not None:
+            y_error = abs(base_pt_far[1] - base_pt_re[1])
+            if y_error > self.LATERAL_CROSSCHECK_M:
+                self.get_logger().warn(
+                    f'Re-detect lateral Y disagrees with far detection by '
+                    f'{y_error * 100:.1f} cm (limit '
+                    f'{self.LATERAL_CROSSCHECK_M * 100:.1f}) - using the far detection for '
+                    'lateral aim.')
+                base_pt = np.array([base_pt_re[0], base_pt_far[1], base_pt_re[2]])
+            else:
+                base_pt = base_pt_re
+        elif base_pt_re is not None:
+            base_pt = base_pt_re
+        elif base_pt_far is not None:
+            base_pt = base_pt_far
+        else:
             return False
 
         row_z = self.ROW_HEIGHTS.get(row)
@@ -660,7 +951,10 @@ class GraspBook(Node):
                     f'Book height {grasp_z:.3f} m ({delta * 100:+.1f} cm from row nominal).')
 
         grasp_p = np.array([base_pt[0] + self.GRASP_DEPTH_INTO_BOOK,
-                            base_pt[1], grasp_z])
+                            base_pt[1] + self.LATERAL_AIM_BIAS, grasp_z])
+        if abs(self.LATERAL_AIM_BIAS) > 1e-6:
+            self.get_logger().info(
+                f'Lateral aim trimmed by {self.LATERAL_AIM_BIAS * 100:+.1f} cm.')
         pregrasp_p = grasp_p - np.array([self.PREGRASP_OFFSET, 0.0, 0.0])
         staging_p = pregrasp_p - np.array([self.STAGING_EXTRA, 0.0, 0.0])
         self.get_logger().info(
@@ -674,11 +968,13 @@ class GraspBook(Node):
         best = None
         for label, R in (('upright', rotation_from_columns((1, 0, 0), (0, 1, 0), (0, 0, 1))),
                          ('rolled', rotation_from_columns((1, 0, 0), (0, -1, 0), (0, 0, -1)))):
-            q_st, pe_st, re_st = self.kin.solve(staging_p, R, seed, bounds=safe_torso,
+            q_st, pe_st, re_st = self.kin.solve(staging_p, R, seed,
+                                                bounds=safe_torso,
                                                 restarts=self.IK_RESTARTS)
             if q_st is None or not self.kin.reached(pe_st, re_st):
                 continue
-            q, pe, re = self.kin.solve(pregrasp_p, R, q_st, bounds=safe_torso,
+            q, pe, re = self.kin.solve(pregrasp_p, R, q_st,
+                                       bounds=safe_torso,
                                        restarts=self.IK_RESTARTS)
             if q is None or not self.kin.reached(pe, re):
                 continue
@@ -704,7 +1000,8 @@ class GraspBook(Node):
 
         if abs(torso_now - torso_target) > self.TORSO_TOLERANCE:
             q_fix, pe, re = self.kin.solve(pregrasp_p, R_grasp, q_pre,
-                                           bounds=torso_bounds, lock=[0])
+                                           bounds=torso_bounds,
+                                           lock=[0], restarts=self.IK_RESTARTS)
             if q_fix is not None and self.kin.reached(pe, re):
                 q_pre = q_fix
                 self.get_logger().info(
@@ -721,18 +1018,69 @@ class GraspBook(Node):
             self.last_failure = 'gripper'
             return False
 
-        self.move_arm([q_stage], seconds_each=3.0)
+        # --- SWING: tuck -> retract -> staging ---
+        retract_x = float(base_pt[0]) - self.RETRACT_BEHIND_BOOK
+        retract_z = float(base_pt[2]) - self.RETRACT_BELOW_BOOK
+        retract_p = np.array([retract_x, -self.SHOULDER_OFFSET, retract_z])
+        retract_bounds = (np.array([torso_now - 1e-4] + [-9.0] * 7),
+                          np.array([torso_now + 1e-4] + [9.0] * 7))
+        q_retract, pe_r, re_r = self.kin.solve(
+            retract_p, R_grasp, self.current_q(),
+            bounds=retract_bounds, lock=[0], restarts=self.IK_RESTARTS)
+        if q_retract is not None and self.kin.reached(pe_r, re_r):
+            self.get_logger().info(
+                f'Swing split: tuck -> retract (x={retract_x:.2f}, z={retract_z:.2f}) -> '
+                'staging.')
+            self.book_contact = False
+            self.move_arm([q_retract], seconds_each=self.arm_move_time(q_retract, 2.5))
+            if self.book_contact:
+                self.get_logger().warn(
+                    'Contact during the TUCK -> RETRACT phase of the swing. Both '
+                    'endpoints are behind the book face, so this should not be possible '
+                    '- check whether the book was already leaning.')
+                self.last_failure = 'bump'
+                return False
+            self.book_contact = False
+            self.move_arm([q_stage], seconds_each=self.arm_move_time(q_stage, 3.0))
+        else:
+            self.get_logger().warn(
+                f'Could not solve the retract waypoint (pe {pe_r * 1000:.0f} mm) - '
+                'swinging directly to staging. The arc may bulge forward; if it does the '
+                'book may be knocked.')
+            self.book_contact = False
+            self.move_arm([q_stage], seconds_each=self.arm_move_time(q_stage, 3.0))
+        if self.book_contact:
+            self.get_logger().warn(
+                'Contact during the RETRACT -> STAGING swing, before the entry even '
+                'began. The retract endpoint is behind the book face, so this means the '
+                'arc bulges past it; the entry is not the problem.')
+            self.last_failure = 'bump'
+            return False
+
         approach, ok = self.kin.cartesian_path(q_stage, [pregrasp_p], R_grasp,
                                                lock=[0], bounds=torso_bounds,
                                                restarts=self.IK_RESTARTS)
         if not ok:
             self.get_logger().error('Could not solve staging -> pre-grasp.')
             return False
-        self.move_arm(approach, seconds_each=2.0)
+        self.book_contact = False
+        self.move_arm(approach, seconds_each=max(
+            2.0, self.arm_move_time(approach[-1], 2.0) / max(1, len(approach))))
+        if self.book_contact:
+            self.get_logger().warn(
+                'Contact during the STAGING -> PRE-GRASP lead-in. Backing out.')
+            self.last_failure = 'bump'
+            return False
 
-        steps = 5
-        waypoints = [pregrasp_p + (grasp_p - pregrasp_p) * (i + 1) / steps
-                     for i in range(steps)]
+        hover_x = float(base_pt[0]) + self.TIP_BEHIND_FRAME - self.TIP_CLEARANCE
+        hover_p = np.array([hover_x, grasp_p[1], grasp_p[2]])
+        na = self.ENTRY_STEPS_APPROACH
+        nc = self.ENTRY_STEPS_COMMIT
+        waypoints = [pregrasp_p + (hover_p - pregrasp_p) * (i + 1) / na
+                     for i in range(na)]
+        waypoints += [hover_p + (grasp_p - hover_p) * (i + 1) / nc
+                      for i in range(nc)]
+        hover_idx = na - 1
         qs, ok = self.kin.cartesian_path(approach[-1], waypoints, R_grasp,
                                          lock=[0], bounds=torso_bounds,
                                          restarts=self.IK_RESTARTS)
@@ -747,11 +1095,63 @@ class GraspBook(Node):
                 self.get_logger().error(
                     f'Entry path would put {link} past the shelf face.')
                 return False
-        self.move_arm(qs, seconds_each=1.0)
+        self.book_contact = False
+        for i, q in enumerate(qs):
+            speed = 2.5 if i >= len(qs) - 3 else 1.2
+            last = (i == len(qs) - 1)
+            self.move_arm([q], seconds_each=self.arm_move_time(q, speed),
+                          precise=last)
+            if i == hover_idx:
+                self.sleep_sim(0.6)
+                if self.book_contact and self.BUMP_GUARD_ENABLED:
+                    self.get_logger().warn(
+                        'Contact at the hover checkpoint, with the tips still clear of '
+                        'the spine - so the aim is off laterally, not too deep. '
+                        'Backing out before committing.')
+                    self.last_failure = 'bump'
+                    return False
+                here = self.kin.fk(self.current_q())[:3, 3]
+                lat = float(here[1] - hover_p[1])
+                self.get_logger().info(
+                    f'Hover checkpoint clear - tips 1 cm short of the spine. '
+                    f'Lateral residual {lat * 100:+.1f} cm '
+                    f'({"gripper left of target" if lat > 0 else "gripper right of target"}), '
+                    f'depth {here[0] - hover_p[0]:+.3f} m. Committing.')
+                if abs(lat) > 0.015:
+                    self.get_logger().warn(
+                        f'{abs(lat) * 100:.1f} cm of lateral residual against ~3 cm of '
+                        'finger clearance - if a finger catches the spine, set '
+                        f'LATERAL_AIM_BIAS to {-lat:+.3f}.')
+                continue
+            if i > hover_idx and i < len(qs) - 1 and self.BUMP_GUARD_ENABLED:
+                if self.book_contact:
+                    self.get_logger().warn(
+                        f'Contact during the commit at waypoint '
+                        f'{i - hover_idx}/{len(qs) - 1 - hover_idx} - aborting before '
+                        'the gripper base reaches the spine.')
+                    self.last_failure = 'bump'
+                    return False
+
+        joint_err = self.arm_error(qs[-1])
+        actual = self.kin.fk(self.current_q())[:3, 3]
+        offset = float(np.linalg.norm(actual - grasp_p))
+        self.get_logger().info(
+            f'Arm settled: gripper at ({actual[0]:.3f}, {actual[1]:.3f}, {actual[2]:.3f}) '
+            f'vs target ({grasp_p[0]:.3f}, {grasp_p[1]:.3f}, {grasp_p[2]:.3f}) - '
+            f'{offset * 100:.1f} cm off, worst joint {joint_err:.3f} rad.')
+        if offset > 0.020:
+            self.get_logger().warn(
+                f'The arm is {offset * 100:.1f} cm from where it was sent. The fingertips '
+                'lead the pads by several centimetres, so they meet the book before the '
+                'pads do - this is what knocks it over. Not closing.')
+            self.last_failure = 'tracking'
+            return False
 
         if self.book_contact and self.BUMP_GUARD_ENABLED:
-            self.get_logger().warn('Bump guard: backing out.')
-            self.last_failure = 'align'
+            self.get_logger().warn(
+                'Bump guard: contact fired during the final commit waypoint. The base of '
+                'the hand may have met the spine. Backing out before closing.')
+            self.last_failure = 'bump'
             return False
 
         self.book_contact = False
@@ -762,23 +1162,14 @@ class GraspBook(Node):
             f'{("%.2f N" % effort) if effort is not None else "n/a"}, '
             f'contact={self.book_contact}.')
 
-        # Contacts fire briefly during the close. Give the sensor a moment to
-        # latch before reading.
         self.sleep_sim(0.5)
 
-        # Reject if the jaws stayed too wide - the pads met something much
-        # thicker than the spine or never finished closing.
         if finger > self.GRIP_STALL_MAX:
             self.get_logger().warn(
                 f'Finger joint at {finger:.4f} - wider than a 2 cm spine. Miss.')
             self.stop_grip_hold()
             return False
 
-        # Position + contact only. Effort readings from this position-controlled
-        # gripper are unreliable (0.00-0.05 N even on a firm grasp, because the
-        # position controller has no motion to oppose). The honest signals are
-        # finger < GRIP_STALL_MAX (pads shut) AND /contacts fired (pads touching
-        # a book mesh).
         if not self.book_contact:
             self.get_logger().warn(
                 f'No gripper-to-book contact (finger joint at {finger:.4f}, '
@@ -803,7 +1194,6 @@ class GraspBook(Node):
 
         self.sleep_sim(1.0)
         finger = self.joint_state.get('gripper_right_finger_joint', 0.0)
-        # Position + contact only, same as the post-close check.
         lost = finger > self.GRIP_STALL_MAX or not self.book_contact
         if lost:
             self.get_logger().warn(
@@ -817,22 +1207,45 @@ class GraspBook(Node):
     def recover_after_failure(self):
         self.stop_grip_hold()
         self.set_gripper(self.GRIP_OPEN, wait=False)
-        seed = self.current_q()
-        target = np.array([0.30, -0.20, 1.05])
-        R = rotation_from_columns((1, 0, 0), (0, -1, 0), (0, 0, -1))
-        q, pe, re = self.kin.solve(target, R, seed)
-        if q is not None and self.kin.reached(pe, re):
-            self.move_arm([q], seconds_each=3.0)
-        else:
-            self.get_logger().warn('No IK for the recovery pose.')
+        try:
+            cur_q = self.current_q()
+            cur_xyz = self.kin.fk(cur_q)[:3, 3]
+            back_x = max(self.RECOVER_RETRACT_MIN_X,
+                         float(cur_xyz[0]) - self.RECOVER_RETRACT_DISTANCE)
+            back_p = np.array([back_x, float(cur_xyz[1]), float(cur_xyz[2])])
+            R = rotation_from_columns((1, 0, 0), (0, -1, 0), (0, 0, -1))
+            safe_torso = (np.array([-0.001] + [-9.0] * 7),
+                          np.array([self.TORSO_MAX_SAFE] + [9.0] * 7))
+            q_back, pe, re = self.kin.solve(
+                back_p, R, cur_q, bounds=safe_torso,
+                lock=[0], restarts=self.IK_RESTARTS)
+            if q_back is not None and self.kin.reached(pe, re):
+                self.move_arm([q_back],
+                              seconds_each=self.arm_move_time(q_back, 2.5))
+                self.get_logger().info(
+                    f'Arm retracted to x={back_x:.2f} before tucking.')
+            else:
+                self.get_logger().warn(
+                    f'Could not solve the retract waypoint (pe {pe * 1000:.0f} mm) - '
+                    'folding directly to tuck. This may drag the book.')
+        except Exception as e:
+            self.get_logger().warn(f'Retract before tuck failed: {e}')
+        self.send_traj(self.arm_pub, ARM_JOINTS, RIGHT_TUCK, 4.0)
+        self.sleep_sim(4.6)
+        self.get_logger().info(
+            'Arm returned to the tuck pose - clear of the head camera.')
 
     def retreat(self, book_xyz, normal, shelf_dir):
         seed = self.current_q()
         R = rotation_from_columns((1, 0, 0), (0, -1, 0), (0, 0, -1))
+        torso_now = float(self.joint_state.get('torso_lift_joint', seed[0]))
+        carry_band = (np.array([torso_now - 1e-4] + [-9.0] * 7),
+                      np.array([torso_now + 1e-4] + [9.0] * 7))
         for target in (np.array([0.34, -0.19, 1.05]),
                        np.array([0.30, -0.22, 1.00]),
                        np.array([0.38, -0.16, 1.10])):
-            q, pe, re = self.kin.solve(target, R, seed)
+            q, pe, re = self.kin.solve(target, R, seed, bounds=carry_band,
+                                       lock=[0], restarts=self.IK_RESTARTS)
             if q is not None and self.kin.reached(pe, re):
                 self.move_arm([q], seconds_each=3.0)
                 self.get_logger().info(

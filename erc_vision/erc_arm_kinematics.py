@@ -39,6 +39,24 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 
+def _tighter(limit, safety, key, soft_key, pick):
+    """The stricter of a joint's URDF limit and its safety_controller soft
+    limit, since the soft limit is the one ros2_control enforces."""
+    hard = None
+    if limit is not None and limit.get(key) is not None:
+        hard = float(limit.get(key))
+    soft = None
+    if safety is not None and safety.get(soft_key) is not None:
+        soft = float(safety.get(soft_key))
+    if hard is None and soft is None:
+        return 0.0
+    if hard is None:
+        return soft
+    if soft is None:
+        return hard
+    return pick(hard, soft)
+
+
 def rpy_to_matrix(r, p, y):
     cr, sr = math.cos(r), math.sin(r)
     cp, sp = math.cos(p), math.sin(p)
@@ -98,6 +116,7 @@ class ArmKinematics:
             origin = j.find('origin')
             axis = j.find('axis')
             limit = j.find('limit')
+            safety = j.find('safety_controller')
             self.joints[j.find('child').get('link')] = {
                 'name': j.get('name'),
                 'type': j.get('type'),
@@ -110,10 +129,13 @@ class ArmKinematics:
                     else ['0', '0', '0'])],
                 'axis': [float(v) for v in axis.get('xyz').split()]
                         if axis is not None else [0.0, 0.0, 1.0],
-                'lower': float(limit.get('lower')) if limit is not None
-                         and limit.get('lower') is not None else 0.0,
-                'upper': float(limit.get('upper')) if limit is not None
-                         and limit.get('upper') is not None else 0.0,
+                # Use the TIGHTER of the URDF limit and the safety_controller
+                # soft limit. The soft limits are what ros2_control actually
+                # enforces - roughly 0.07 rad inside the URDF values on this
+                # arm - so a solution sitting exactly on a URDF limit is a
+                # trajectory point the controller can refuse.
+                'lower': _tighter(limit, safety, 'lower', 'soft_lower_limit', max),
+                'upper': _tighter(limit, safety, 'upper', 'soft_upper_limit', min),
             }
 
         chain = []
