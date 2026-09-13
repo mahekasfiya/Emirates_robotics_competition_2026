@@ -35,6 +35,8 @@ setup(
                 'tuck_arms_once = erc_vision.tuck_arms_once:main',
                 'set_initial_pose = erc_vision.set_initial_pose:main',
                 'approach_column = erc_vision.approach_column:main',
+                'grasp_book = erc_vision.grasp_book:main',
+                'return_and_place = erc_vision.return_and_place:main',
         ],
     },
 )

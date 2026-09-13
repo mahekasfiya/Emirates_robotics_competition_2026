@@ -16,22 +16,12 @@ WHAT THIS DOES
   5. Publishes the target column number, saves ONE annotated competition
      image, writes the geometry to JSON for approach_column.py, exits 0.
 
-WHY A LINE FIT INSTEAD OF A SINGLE MARKER
-  A single marker gives you a point but no orientation, so "face the
-  column" has to be guessed from the robot's own heading - which is
-  exactly the bug that made the old navigate_to_column.py arrive facing
-  the wrong way.  Five collinear markers give both position AND the
-  shelf's orientation directly.  Projecting the target marker back onto
-  the fitted line also cancels most of the per-marker depth noise.
-
-WHY EVERYTHING IS READ FROM ONE POSE
-  The head tilt joint stops at +0.349 rad (+20 deg).  The marker plates
-  sit at z = 2.26 m.  Close to the shelf they are simply above the
-  camera's reach, so marker reading MUST happen from a distance - which
-  is also where all five fit in the 87 deg horizontal FOV at once.
-
-EXITS CLEANLY (code 0) so the launch file's OnProcessExit can sequence
-approach_column.py next.
+Frame handling:
+  Latest-frame cache. The robot is stationary during perception, so the
+  most recent frame from each camera is what we want. At low simulation
+  real-time factor the ApproximateTimeSynchronizer silently dropped
+  nearly every color/depth pair because their stamps drifted apart; a
+  direct cache avoids that entirely and works at any frame rate.
 """
 
 import base64
@@ -46,7 +36,6 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped, Twist
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
@@ -59,8 +48,6 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 
 HANDOFF_FILE = '/tmp/erc_target_column.json'
 
-# Digit templates extracted from a real captured frame of this sim via plain
-# contour detection (no OCR), visually verified before embedding.  ~35x38 px.
 DIGIT_TEMPLATES_B64 = {
     1: "iVBORw0KGgoAAAANSUhEUgAAACUAAAAmCAAAAABmYQ1xAAAAvElEQVQ4EY3BAVLDMBDAQOn/jxaBHrE9hUx3DeQ/8SLP4pvJowzkXVzkJQk5xC+5hVzindxCIP4gt5BLvJNbCMQf5BZyiTeyhBxiyBJyihdZQg4xZAk5xJAl5BBDlpBDDFlCDjFkCTnEkCVMNjFkCZNNDFnCZBNDljDZxJAl5BBDNskhhmySQwzZJIcYskkOMWSTHGLITg4xZCeH+CUbuQQIxEYWgXgkmMQjQSAeCXKJH7KJISCfkE/IJ74AbIdGDB6jZUAAAAAASUVORK5CYII=",
     2: "iVBORw0KGgoAAAANSUhEUgAAACUAAAAmCAAAAABmYQ1xAAAAw0lEQVQ4EY3BgWGDMAADMPn/o70EQgsbZZVSQ3xWpOIflcZ/Kk7qJN7iUL/FIXZ1J3axqXuxiak+iSmG2sVSLzHEUFOc1BJDUFNc1BIENcVFLUFQU1zUEgQ1xUUtQVBTXNQuhrhXSwxxr3YxxZ1aYhN3aolN/FVLLGlc1SEOaVzUEm9pnNUuzuKsdvHSIN5qF4caQrzUJt6KIJbaxVsNQWzqoyCGehAE9SCGoB7EENSDGIJ6EEN8VkMM8agxxTfiG/GNH5xHNCRBTtK8AAAAAElFTkSuQmCC",
@@ -83,59 +70,44 @@ def normalize_angle(a):
 class ColumnDetector(Node):
 
     # --- Template matching ---------------------------------------------
-    # TM_CCOEFF_NORMED, calibrated against real frames from this sim:
-    # genuine digits scored 0.40-0.60, non-digit shelf structure 0.11-0.36.
     MIN_TEMPLATE_SCORE = 0.37
-    # A digit must beat the runner-up template by this much.  Misreading a
-    # 1 as a 4 sends the robot to the wrong column and forfeits every
-    # downstream point, so an ambiguous blob is worth discarding.
     MIN_TEMPLATE_MARGIN = 0.06
     MIN_BLOB_AREA = 400
     MAX_BLOB_AREA = 2500
     MIN_BLOB_ASPECT = 0.5
     MAX_BLOB_ASPECT = 2.0
-    CROP_FRACTION = 0.4           # markers live in the top of the frame
+    CROP_FRACTION = 0.4
 
     # --- Search rotation -----------------------------------------------
-    ROTATE_SPEED = 0.35           # rad/s while hunting for the shelf
+    ROTATE_SPEED = 0.35
     ROTATE_MAX_RADIANS = 2 * math.pi * 1.15
-    SEARCH_CONFIRM_FRAMES = 3     # frames with >=1 marker before slowing down
+    SEARCH_CONFIRM_FRAMES = 3
 
     # --- Centring --------------------------------------------------------
-    # Seeing ONE marker is not enough.  The first marker to appear does so
-    # at the edge of the frame, with the rest of the shelf still outside the
-    # field of view - stopping there leaves nothing to fit a line through,
-    # which collapses to "face the marker from wherever you happen to be"
-    # and approaches the shelf diagonally.  So after first contact we keep
-    # turning, more slowly, until the shelf is actually centred.
-    CENTRING_SPEED = 0.15         # rad/s
-    MIN_MARKERS_TO_STOP = 4       # of 5; one can be clipped or occluded
-    CENTRE_TOLERANCE_PX = 80      # marker centroid vs image centre
-    CENTRING_TIMEOUT_SEC = 20.0   # then settle for whatever is in frame
+    CENTRING_SPEED = 0.15
+    MIN_MARKERS_TO_STOP = 4
+    CENTRE_TOLERANCE_PX = 80
+    CENTRING_TIMEOUT_SEC = 20.0
     MAX_LINE_FIT_RETRIES = 2
 
-    # Position hold while rotating.  The table sits ~0.19 m from the base's
-    # rear edge in the start zone, so even small translation during the
-    # spin is worth cancelling.  PI, because pure-P settles at a non-zero
-    # offset against a continuous disturbance.
     HOLD_KP = 1.8
     HOLD_KI = 0.6
-    HOLD_DEADBAND = 0.02          # m - don't fight sub-2cm noise
+    HOLD_DEADBAND = 0.02
     HOLD_INTEGRAL_CLAMP = 0.3
     HOLD_MAX_SPEED = 0.20
-    ABORT_DRIFT = 0.14            # m - stop and report rather than hit the table
+    ABORT_DRIFT = 0.14
     TICK = 0.1
 
     # --- Confirmation ---------------------------------------------------
-    CONFIRM_FRAMES = 4            # consecutive frames with a stable target
+    CONFIRM_FRAMES = 4
     PIXEL_TOLERANCE = 25
-    CONFIRM_TIMEOUT_SEC = 5.0     # per head-pan position
-    PAN_FALLBACK = [0.0, -0.5, 0.5, -1.0, 1.0]   # head_1_joint limit is +-1.309
+    CONFIRM_TIMEOUT_SEC = 5.0
+    PAN_FALLBACK = [0.0, -0.5, 0.5, -1.0, 1.0]
     MAX_TF_RETRIES = 8
 
     # --- Geometry sanity ------------------------------------------------
-    EXPECTED_MARKER_PITCH = 1.0   # m between adjacent columns
-    PITCH_TOLERANCE = 0.35        # m
+    EXPECTED_MARKER_PITCH = 1.0
+    PITCH_TOLERANCE = 0.35
 
     def __init__(self):
         super().__init__('column_detector')
@@ -145,7 +117,7 @@ class ColumnDetector(Node):
         self.declare_parameter('purge_images_dir', True)
         self.declare_parameter('marker_tilt', 0.10)
         self.declare_parameter('rotate_clockwise', True)
-        self.declare_parameter('standoff_from_marker', 0.85)
+        self.declare_parameter('standoff_from_marker', 0.60)
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('save_debug_frames', False)
         self.declare_parameter('annotate_other_markers', False)
@@ -163,6 +135,15 @@ class ColumnDetector(Node):
             raise ValueError(f'shelf_column_number must be 1-5, got {self.target}')
         self.get_logger().info(f'Target shelf column: {self.target}')
 
+        # Clear any stale handoff file so a crash mid-run cannot leave a
+        # previous trial's goal to be silently used by downstream nodes.
+        if os.path.exists(HANDOFF_FILE):
+            try:
+                os.remove(HANDOFF_FILE)
+                self.get_logger().info(f'Cleared stale {HANDOFF_FILE}.')
+            except OSError as e:
+                self.get_logger().warn(f'Could not clear {HANDOFF_FILE}: {e}')
+
         self._prepare_images_dir()
 
         self.bridge = CvBridge()
@@ -177,7 +158,7 @@ class ColumnDetector(Node):
         self.centring_started = 0.0
         self.line_fit_retries = 0
         self.image_width = 640
-        self.history = []                # (cx, cy) of the target across frames
+        self.history = []
         self.pan_index = 0
         self.phase_started = time.time()
         self.tf_retries = 0
@@ -187,13 +168,18 @@ class ColumnDetector(Node):
         # Rotation / drift tracking
         self.cumulative_rotation = 0.0
         self.last_imu_stamp = None
-        self.yaw = None                  # IMU-integrated, seeded from odom
+        self.yaw = None
         self.start_xy = None
         self.current_xy = None
         self.integral = [0.0, 0.0]
         self._log_tick = 0
 
-        # Latch the identification so a late-joining subscriber still gets it.
+        # Latest-frame cache (replaces ApproximateTimeSynchronizer)
+        self._latest_color = None
+        self._latest_depth = None
+        self._color_stamp = 0.0
+        self._depth_stamp = 0.0
+
         latched = QoSProfile(
             depth=1,
             reliability=ReliabilityPolicy.RELIABLE,
@@ -213,14 +199,34 @@ class ColumnDetector(Node):
             self.camera_info_cb, 10)
         self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
         self.create_subscription(Imu, '/base_imu', self.imu_cb, 10)
+        self.create_subscription(
+            Image,
+            '/head_front_camera/head_front_camera/color/image_raw',
+            self._color_cb, 5)
+        self.create_subscription(
+            Image,
+            '/head_front_camera/head_front_camera/depth/image_rect_raw',
+            self._depth_cb, 5)
+        # Wait for the map frame before starting. AMCL can be slower than the
+        # launch-file delay allows, especially on a loaded machine, and every
+        # marker localisation needs map->base_link.
+        wait_start = time.time()
+        while time.time() - wait_start < 30.0:
+            try:
+                self.tf_buffer.lookup_transform(
+                    self.map_frame, 'base_link', RclTime(),
+                    timeout=rclpy.duration.Duration(seconds=0.5))
+                self.get_logger().info(
+                    'TF map -> base_link available. Starting detection.')
+                break
+            except Exception:
+                time.sleep(0.5)
+        else:
+            self.get_logger().warn(
+                'TF map -> base_link not available after 30 s. Continuing anyway - '
+                'localisation will fail if AMCL is still starting up.')
 
-        color_sub = Subscriber(self, Image,
-                               '/head_front_camera/head_front_camera/color/image_raw')
-        depth_sub = Subscriber(self, Image,
-                               '/head_front_camera/head_front_camera/depth/image_rect_raw')
-        self.sync = ApproximateTimeSynchronizer([color_sub, depth_sub],
-                                                queue_size=10, slop=0.05)
-        self.sync.registerCallback(self.image_cb)
+        self.send_head(0.0, self.marker_tilt)
 
         self.send_head(0.0, self.marker_tilt)
         self.timer = self.create_timer(self.TICK, self.tick)
@@ -231,13 +237,29 @@ class ColumnDetector(Node):
             f'{self.marker_tilt:.2f} rad so the 2.26 m marker plates are framed).')
 
     # ------------------------------------------------------------------
+    # Frame callbacks (latest-frame cache)
+    # ------------------------------------------------------------------
+    def _color_cb(self, msg):
+        self._latest_color = msg
+        self._color_stamp = time.time()
+        self._try_process_frame()
+
+    def _depth_cb(self, msg):
+        self._latest_depth = msg
+        self._depth_stamp = time.time()
+
+    def _try_process_frame(self):
+        if self._latest_color is None or self._latest_depth is None:
+            return
+        now = time.time()
+        if now - self._color_stamp > 0.5 or now - self._depth_stamp > 0.5:
+            return
+        self.image_cb(self._latest_color, self._latest_depth)
+
+    # ------------------------------------------------------------------
     # Setup helpers
     # ------------------------------------------------------------------
     def _prepare_images_dir(self):
-        """The rules require a folder containing ONLY images produced during
-        the trial.  Leftovers from a previous run would be indistinguishable
-        from this run's output, so clear it once, here, at the start of the
-        first node that writes to it."""
         os.makedirs(self.images_dir, exist_ok=True)
         if not bool(self.get_parameter('purge_images_dir').value):
             return
@@ -289,17 +311,11 @@ class ColumnDetector(Node):
     def odom_cb(self, msg):
         self.current_xy = (msg.pose.pose.position.x, msg.pose.pose.position.y)
         if self.yaw is None:
-            # Seed the IMU integration from odom once, before wheel slip has
-            # had a chance to accumulate, so our yaw shares /odom's convention.
             self.yaw = yaw_from_quat(msg.pose.pose.orientation)
         if self.phase == 'search' and self.start_xy is None:
             self.start_xy = self.current_xy
 
     def imu_cb(self, msg):
-        """Yaw comes from the gyro, not wheel odometry.  A real run measured
-        414 deg of odometry 'rotation' while the robot ended up facing its
-        original direction - wheel slip corrupts odometry yaw.  The IMU
-        measures rotation inertially and is not fooled by it."""
         stamp = RclTime.from_msg(msg.header.stamp)
         if self.last_imu_stamp is not None and self.yaw is not None:
             dt = (stamp - self.last_imu_stamp).nanoseconds / 1e9
@@ -384,10 +400,6 @@ class ColumnDetector(Node):
         self.cmd_pub.publish(twist)
 
     def confirm_tick(self):
-        """Watchdog for the hold-still phase.  If the target digit hasn't
-        appeared at this head-pan angle within the timeout, pan further
-        rather than waiting forever; only if every pan angle is exhausted
-        do we go back to rotating the base."""
         if time.time() - self.phase_started < self.CONFIRM_TIMEOUT_SEC:
             return
         self.pan_index += 1
@@ -478,10 +490,6 @@ class ColumnDetector(Node):
         self.finalise(color, depth, color_msg.header, markers, hit)
 
     def detect_markers(self, color_img):
-        """Return EVERY digit-shaped blob that classifies confidently, as a
-        list of dicts.  Reading all five at once is what makes the shelf
-        line fit possible, and it means one frame answers the whole
-        question instead of a pan-and-sweep search."""
         h, w = color_img.shape[:2]
         crop = color_img[0:int(h * self.CROP_FRACTION), 0:w]
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
@@ -552,9 +560,6 @@ class ColumnDetector(Node):
         target_xy = np.array(target_pt[:2])
 
         if direction is None and self.line_fit_retries < self.MAX_LINE_FIT_RETRIES:
-            # Fewer than 3 markers means no shelf line, which means no true
-            # perpendicular.  That is worth another attempt at framing the
-            # shelf rather than accepting a diagonal approach.
             self.line_fit_retries += 1
             self.get_logger().warn(
                 f'Only {len(located)} marker(s) localised - not enough for a shelf-line fit. '
@@ -566,9 +571,6 @@ class ColumnDetector(Node):
             return
 
         if direction is not None:
-            # Project the target onto the fitted line.  Per-marker depth
-            # noise is mostly perpendicular to the shelf; the line is
-            # averaged over every marker, so this is the better estimate.
             centroid = pts.mean(axis=0)
             target_xy = centroid + direction * float(np.dot(target_xy - centroid, direction))
             self.check_marker_pitch(pts, direction)
@@ -587,7 +589,6 @@ class ColumnDetector(Node):
             n = v / (np.linalg.norm(v) + 1e-9)
             normal = -n
 
-        # Orient the normal so it points from the shelf back toward the robot.
         robot = self.robot_xy()
         if robot is not None and float(np.dot(normal, robot - target_xy)) < 0:
             normal = -normal
@@ -637,9 +638,6 @@ class ColumnDetector(Node):
 
         pt = PointStamped()
         pt.header.frame_id = header.frame_id
-        # Zero stamp = "latest available transform".  Asking for the exact
-        # camera timestamp fails with extrapolation errors whenever TF lags
-        # the camera, and we are holding still here, so latest is fine.
         pt.header.stamp = RclTime().to_msg()
         pt.point.x = (cx - px) * z / fx
         pt.point.y = (cy - py) * z / fy
@@ -654,9 +652,6 @@ class ColumnDetector(Node):
 
     @staticmethod
     def fit_shelf_line(pts):
-        """Principal axis of the marker positions.  Returns (unit direction
-        along the shelf face, unit normal), or (None, None) if there are too
-        few points to define a line."""
         if len(pts) < 3:
             return None, None
         centred = pts - pts.mean(axis=0)
@@ -666,10 +661,6 @@ class ColumnDetector(Node):
         return direction, normal
 
     def check_marker_pitch(self, pts, direction):
-        """The five columns are 1.0 m apart.  Projecting the markers onto the
-        fitted line and differencing gives a free correctness check on the
-        whole perception chain - intrinsics, depth scale and TF all have to
-        be right for this to come out at 1.0 m."""
         s = sorted(float(np.dot(p - pts.mean(axis=0), direction)) for p in pts)
         gaps = [b - a for a, b in zip(s, s[1:])]
         if not gaps:
@@ -697,8 +688,6 @@ class ColumnDetector(Node):
 
     @staticmethod
     def sample_depth(depth, cx, cy, window=3):
-        """Depth arrives as float32 metres (the gz rgbd_camera publishes a
-        float depth image, bridged straight through), so no unit conversion."""
         h, w = depth.shape[:2]
         patch = depth[max(0, cy - window):min(h, cy + window),
                       max(0, cx - window):min(w, cx + window)].astype(np.float32)
@@ -709,11 +698,6 @@ class ColumnDetector(Node):
     # Images
     # ------------------------------------------------------------------
     def save_competition_image(self, color, markers, hit):
-        """The rubric awards +2 for 'an image with a bounding box around the
-        target shelf column', so the box spans the whole column strip, not
-        just the numeral.  A timestamp is drawn into the pixels because the
-        organisers verify the capture happened during the trial and a
-        filename alone is trivially forgeable."""
         img = color.copy()
         h, w = img.shape[:2]
 
@@ -752,8 +736,6 @@ class ColumnDetector(Node):
             self.exit_code = 1
 
     def save_debug_frame(self, color, markers):
-        """Dev-only diagnostics, off by default, and written somewhere OTHER
-        than the competition folder so that folder stays clean."""
         if not self.debug:
             return
         self._debug_counter += 1
@@ -783,14 +765,10 @@ def main(args=None):
     node = ColumnDetector()
     code = 0
     try:
-        # Polling should_exit rather than calling rclpy.shutdown() from
-        # inside a callback: shutting down mid-callback does not reliably
-        # make spin() return here, which previously left the process alive
-        # and silently broke the launch file's OnProcessExit sequencing.
         while rclpy.ok() and not node.should_exit:
             rclpy.spin_once(node, timeout_sec=0.1)
         node.stop_base()
-        time.sleep(0.3)          # let the stop command and final logs flush
+        time.sleep(0.3)
         code = node.exit_code
     finally:
         node.destroy_node()

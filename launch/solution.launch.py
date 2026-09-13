@@ -76,7 +76,7 @@ def generate_launch_description():
         DeclareLaunchArgument('map', default_value=default_map),
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('erc_images_dir', default_value=default_images),
-        DeclareLaunchArgument('nav2_settle_sec', default_value='8.0',
+        DeclareLaunchArgument('nav2_settle_sec', default_value='20.0',
                               description='Delay before seeding AMCL, to let Nav2 activate.'),
         DeclareLaunchArgument('save_debug_frames', default_value='false'),
         DeclareLaunchArgument('standoff_from_marker', default_value='0.85',
@@ -172,6 +172,9 @@ def generate_launch_description():
             'erc_images_dir': ParameterValue(
                 LaunchConfiguration('erc_images_dir'), value_type=str),
             'purge_images_dir': False,   # stage 2 already cleared it
+            'save_debug_frames': ParameterValue(
+                LaunchConfiguration('save_debug_frames'), value_type=bool),
+            'column_tolerance':0.55,
         }],
     )
 
@@ -190,7 +193,7 @@ def generate_launch_description():
                 actions=[initial_pose])],
         )),
         RegisterEventHandler(OnProcessExit(
-            target_action=initial_pose, on_exit=[column_detector])),
+            target_action=initial_pose, on_exit=[TimerAction(period=5.0, actions=[column_detector])])),
         RegisterEventHandler(OnProcessExit(
             target_action=column_detector, on_exit=[approach])),
         RegisterEventHandler(OnProcessExit(

@@ -32,4 +32,5 @@
   <exec_depend>launch_ros</exec_depend>
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
+  <depend>ros_gz_interfaces</depend>
 </package>

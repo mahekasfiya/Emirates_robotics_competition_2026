@@ -7,40 +7,12 @@ Finds the book of the requested colour IN THAT COLUMN, works out which of
 the four shelf rows it sits in, publishes the row, saves the competition
 image, and writes the book's 3D position for the grasp stage.
 
-WHY A TILT SWEEP IS UNAVOIDABLE HERE
-  Parked 0.60 m off the marker plane, the camera is roughly 0.64 m from
-  the book faces.  The vertical FOV is 56 deg, so it spans about 0.68 m of
-  shelf at that range - but the four book rows span 0.99 m.  No single head
-  pose frames them all.  Three tilt positions with overlap do:
-
-      tilt +0.30 rad  covers roughly rows 1-2
-      tilt -0.15 rad  covers roughly rows 2-3
-      tilt -0.55 rad  covers roughly rows 3-4
-
-  (Head tilt is limited to -1.047 .. +0.349 rad, so there is not much room
-  above +0.30 anyway.)  The sweep stops the moment the target colour is
-  confirmed, so on average it costs one or two dwells, not three.
-
-WHY THE ROW NUMBER DOES NOT COME FROM THE TILT ANGLE
-  It is tempting to say "I found it at tilt index 1, so it is row 2", but
-  each tilt sees two rows at once, so that mapping is a guess.  Instead the
-  blob is unprojected with depth + intrinsics, transformed into the map
-  frame, and its HEIGHT is matched against the four known shelf heights.
-  Those heights are fixed by the arena, so the row falls out exactly, and
-  it does not matter which tilt happened to catch the book.
-
-WHY THE COLUMN FILTER IS DONE ALONG THE SHELF LINE
-  At this range the camera sees about 1.21 m of shelf width, so a book in a
-  neighbouring column can clip the edge of the frame.  Books are jittered
-  +-0.25 m inside a 1.0 m column pitch, which means two adjacent books can
-  be as close as 0.5 m apart - so the tolerance has to be tighter than
-  half the pitch.  Each candidate is projected onto the shelf line that
-  column_detector.py fitted and compared against the target marker's
-  position on that same line.
-
-  The previous version compared a base_link y-coordinate captured BEFORE
-  navigation against one measured AFTER it - two different frames at two
-  different robot poses - which silently rejected the correct book.
+Frame handling:
+  Latest-frame cache. The robot is stationary during perception, so the
+  most recent frame from each camera is what we want. At low simulation
+  real-time factor the ApproximateTimeSynchronizer silently dropped
+  nearly every color/depth pair because their stamps drifted apart; a
+  direct cache avoids that entirely and works at any frame rate.
 """
 
 import json
@@ -54,7 +26,6 @@ import numpy as np
 import rclpy
 from cv_bridge import CvBridge
 from geometry_msgs.msg import PointStamped
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time as RclTime
@@ -67,11 +38,6 @@ from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 COLUMN_FILE = '/tmp/erc_target_column.json'
 BOOK_FILE = '/tmp/erc_target_book.json'
 
-# OpenCV HSV: H is 0-179.  The books are rendered from pure RGBA primaries,
-# so they are far more saturated than anything else in the arena - the
-# shelf, floor and walls are all near-grey.  That makes the saturation
-# floor the real discriminator and lets the hue windows stay generous.
-# Red straddles the H wraparound and therefore needs two windows.
 COLOUR_RANGES = {
     'red':    [((0, 110, 50), (9, 255, 255)), ((170, 110, 50), (179, 255, 255))],
     'green':  [((45, 90, 40), (88, 255, 255))],
@@ -79,41 +45,33 @@ COLOUR_RANGES = {
     'yellow': [((22, 110, 70), (36, 255, 255))],
 }
 
-# Book heights above the floor, from simulation.launch.py:
-#   SHELF_Z (1.1) + TOP_BOOK_Z (0.825) - i * ROW_SPACING (0.33), for the
-#   four active rows.  Listed top row first.
 DEFAULT_ROW_HEIGHTS = [1.595, 1.265, 0.935, 0.605]
 
 
 class BookColourDetector(Node):
 
     # --- Blob filtering --------------------------------------------------
-    # A book presents a 0.16 m x 0.25 m face.  At the ~0.64 m parked range
-    # that is roughly 84 x 132 px, so about 11 000 px^2 - the old 5 000 cap
-    # rejected every book at this distance.  The bounds below stay wide
-    # enough for partially clipped and neighbouring-column books; shape and
-    # 3D position do the real filtering.
-    MIN_CONTOUR_AREA = 900
+    MIN_CONTOUR_AREA = 300
     MAX_CONTOUR_AREA = 60000
-    MIN_ASPECT = 0.25             # width / height; nominal is 0.64
+    MIN_ASPECT = 0.05
     MAX_ASPECT = 1.40
-    MIN_SOLIDITY = 0.65           # contour area / bounding-box area
-    MORPH_KERNEL = 5
+    MIN_SOLIDITY = 0.65
+    MORPH_KERNEL = 3
 
     # --- Sweep -----------------------------------------------------------
-    DEFAULT_TILTS = [0.30, -0.15, -0.55]
-    DWELL_SEC = 2.2               # per tilt position
-    HEAD_SETTLE_SEC = 0.9         # ignore frames while the head is moving
-    MAX_PASSES = 2                # full sweeps before giving up
+    DEFAULT_TILTS = [0.349, 0.10, -0.25, -0.55, -0.85]
+    DWELL_SEC = 2.2
+    HEAD_SETTLE_SEC = 0.9
+    MAX_PASSES = 2
 
     # --- Confirmation ----------------------------------------------------
     CONFIRM_FRAMES = 3
     PIXEL_TOLERANCE = 30
 
     # --- 3D gating -------------------------------------------------------
-    MIN_BOOK_DEPTH = 0.25         # m from the camera
+    MIN_BOOK_DEPTH = 0.25
     MAX_BOOK_DEPTH = 1.60
-    MAX_ROW_RESIDUAL = 0.13       # m; half the 0.33 row spacing is 0.165
+    MAX_ROW_RESIDUAL = 0.13
 
     def __init__(self):
         super().__init__('book_color_detector')
@@ -147,9 +105,9 @@ class BookColourDetector(Node):
                 if os.path.isfile(path):
                     os.remove(path)
 
-        self.target_s = None        # target column's position along the shelf line
-        self.shelf_dir = None       # unit vector along the shelf face
-        self.shelf_origin = None    # the target marker, used as the line's origin
+        self.target_s = None
+        self.shelf_dir = None
+        self.shelf_origin = None
         self.column = None
         self._load_column_handoff()
 
@@ -165,6 +123,12 @@ class BookColourDetector(Node):
         self.image_width = 640
         self._debug_counter = 0
         self._last_reject_reason = ''
+
+        # Latest-frame cache (replaces ApproximateTimeSynchronizer)
+        self._latest_color = None
+        self._latest_depth = None
+        self._color_stamp = 0.0
+        self._depth_stamp = 0.0
 
         latched = QoSProfile(
             depth=1,
@@ -182,13 +146,14 @@ class BookColourDetector(Node):
         self.create_subscription(
             CameraInfo, '/head_front_camera/head_front_camera/color/camera_info',
             self.camera_info_cb, 10)
-        color_sub = Subscriber(self, Image,
-                               '/head_front_camera/head_front_camera/color/image_raw')
-        depth_sub = Subscriber(self, Image,
-                               '/head_front_camera/head_front_camera/depth/image_rect_raw')
-        self.sync = ApproximateTimeSynchronizer([color_sub, depth_sub],
-                                                queue_size=10, slop=0.05)
-        self.sync.registerCallback(self.image_cb)
+        self.create_subscription(
+            Image,
+            '/head_front_camera/head_front_camera/color/image_raw',
+            self._color_cb, 5)
+        self.create_subscription(
+            Image,
+            '/head_front_camera/head_front_camera/depth/image_rect_raw',
+            self._depth_cb, 5)
 
         self.goto_tilt(0)
         self.create_timer(0.2, self.tick)
@@ -198,10 +163,27 @@ class BookColourDetector(Node):
             'at this range.')
 
     # ------------------------------------------------------------------
+    # Frame callbacks (latest-frame cache)
+    # ------------------------------------------------------------------
+    def _color_cb(self, msg):
+        self._latest_color = msg
+        self._color_stamp = time.time()
+        self._try_process_frame()
+
+    def _depth_cb(self, msg):
+        self._latest_depth = msg
+        self._depth_stamp = time.time()
+
+    def _try_process_frame(self):
+        if self._latest_color is None or self._latest_depth is None:
+            return
+        now = time.time()
+        if now - self._color_stamp > 0.5 or now - self._depth_stamp > 0.5:
+            return
+        self.image_cb(self._latest_color, self._latest_depth)
+
+    # ------------------------------------------------------------------
     def _load_column_handoff(self):
-        """The shelf line that column_detector.py fitted is reused here, so
-        the column filter works in the same geometry the navigation goal was
-        built from rather than in a stale robot-relative frame."""
         try:
             with open(COLUMN_FILE) as f:
                 data = json.load(f)
@@ -213,10 +195,9 @@ class BookColourDetector(Node):
         marker = np.array(data['marker_xy'], dtype=float)
         normal = np.array(data['shelf_normal'], dtype=float)
         normal = normal / (np.linalg.norm(normal) + 1e-9)
-        # Along-shelf direction is simply the normal rotated 90 degrees.
         self.shelf_dir = np.array([-normal[1], normal[0]])
         self.shelf_origin = marker
-        self.target_s = 0.0         # the marker is the origin, so it sits at 0
+        self.target_s = 0.0
 
     def along_shelf(self, xy):
         return float(np.dot(np.asarray(xy) - self.shelf_origin, self.shelf_dir))
@@ -268,8 +249,6 @@ class BookColourDetector(Node):
     def image_cb(self, color_msg, depth_msg):
         if self.should_exit or self.camera_matrix is None:
             return
-        # Frames captured mid-motion are blurred and their TF is a moving
-        # target, so give the head a moment to arrive before trusting them.
         if time.time() - self.tilt_started < self.HEAD_SETTLE_SEC:
             return
         try:
@@ -303,13 +282,6 @@ class BookColourDetector(Node):
         self.finalise(color, blob, position, row, residual)
 
     def find_colour_blobs(self, color):
-        """Every blob of the target colour, not just the biggest one.
-
-        The previous version took max(contours, key=contourArea) and kept
-        only that.  If two books of the same colour were in frame and the
-        larger one belonged to a neighbouring column, the correct book was
-        never even considered - and because the same blob was re-found every
-        frame, it rejected forever instead of moving on."""
         hsv = cv2.cvtColor(color, cv2.COLOR_BGR2HSV)
         mask = None
         for lo, hi in COLOUR_RANGES[self.colour]:
@@ -332,8 +304,6 @@ class BookColourDetector(Node):
             aspect = w / float(h)
             if aspect < self.MIN_ASPECT or aspect > self.MAX_ASPECT:
                 continue
-            # A book face is a filled rectangle. Colour bleed and specular
-            # highlights produce ragged, low-solidity blobs.
             if area / float(w * h) < self.MIN_SOLIDITY:
                 continue
             out.append({'contour': cnt, 'box': (x, y, w, h), 'area': area,
@@ -341,8 +311,6 @@ class BookColourDetector(Node):
         return out
 
     def pick_target_blob(self, depth, header, blobs):
-        """Localise every candidate and keep the one that best belongs to the
-        target column. Returns (blob, map position, row number, residual)."""
         scored = []
         rejects = []
         for blob in blobs:
@@ -377,9 +345,6 @@ class BookColourDetector(Node):
         return blob, pos, row, residual
 
     def blob_depth(self, depth, blob):
-        """Median depth over the blob's own pixels.  Sampling a square window
-        around the centroid would mix in shelf behind the book at the edges;
-        masking to the contour keeps the sample on the book face."""
         mask = np.zeros(depth.shape[:2], np.uint8)
         cv2.drawContours(mask, [blob['contour']], -1, 255, thickness=cv2.FILLED)
         vals = depth[mask > 0].astype(np.float32)
@@ -391,7 +356,7 @@ class BookColourDetector(Node):
         px, py = self.camera_matrix[0, 2], self.camera_matrix[1, 2]
         pt = PointStamped()
         pt.header.frame_id = header.frame_id
-        pt.header.stamp = RclTime().to_msg()      # latest available transform
+        pt.header.stamp = RclTime().to_msg()
         pt.point.x = (cx - px) * z / fx
         pt.point.y = (cy - py) * z / fy
         pt.point.z = float(z)
@@ -403,9 +368,6 @@ class BookColourDetector(Node):
         return np.array([out.point.x, out.point.y, out.point.z])
 
     def snap_row(self, height):
-        """Row number from the book's measured height.  The four shelf
-        heights are fixed by the arena and 0.33 m apart, so a correct
-        measurement lands well inside the nearest bin."""
         residuals = [abs(height - z) for z in self.row_heights]
         idx = int(np.argmin(residuals))
         row = idx + 1 if self.top_down else len(self.row_heights) - idx
@@ -445,11 +407,6 @@ class BookColourDetector(Node):
         self.should_exit = True
 
     def save_competition_image(self, color, blob, row):
-        """+2 points for 'an image with a bounding box around the target
-        book'.  The box is the blob's own bounding rect rather than a fixed
-        offset, so it actually tracks the book.  The timestamp is drawn into
-        the pixels because the organisers verify the capture happened during
-        the trial, and a filename proves nothing."""
         img = color.copy()
         h, w = img.shape[:2]
         x, y, bw, bh = blob['box']
@@ -476,8 +433,6 @@ class BookColourDetector(Node):
             self.exit_code = 1
 
     def save_debug_frame(self, color, blobs):
-        """Written to /tmp, never to the competition folder, so that folder
-        holds only the two scored images."""
         if not self.debug:
             return
         self._debug_counter += 1
@@ -505,7 +460,7 @@ def main(args=None):
     try:
         while rclpy.ok() and not node.should_exit:
             rclpy.spin_once(node, timeout_sec=0.1)
-        time.sleep(0.3)          # let the latched publish and final logs flush
+        time.sleep(0.3)
         code = node.exit_code
     finally:
         node.destroy_node()
