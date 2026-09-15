@@ -2,18 +2,39 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
 #
-# up.sh applies this automatically when it detects an NVIDIA GPU plus a working
-# container toolkit. The deploy.resources route uses nvidia-container-toolkit /
-# CDI and does NOT require nvidia to be Docker's default runtime.
+# up.sh applies this automatically when it detects an NVIDIA GPU.
+#
+# For OpenGL (not just CUDA) to work inside the container, WSLg requires
+# these specific resources according to Microsoft's container guide:
+#   - /dev/dxg device       : the DirectX GPU kernel bridge
+#   - /usr/lib/wsl mount    : the WSL driver tree (not just /lib)
+#   - LD_LIBRARY_PATH       : so Mesa finds libd3d12.so and libdxcore.so
+#   - /tmp/.X11-unix mount  : so GUI apps reach the X server
+#   - /mnt/wslg mount       : Wayland and PulseAudio
 services:
   erc:
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - NVIDIA_DRIVER_CAPABILITIES=all
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      - LIBGL_ALWAYS_SOFTWARE=0
+      # Set MESA_LOADER_DRIVER_OVERRIDE only if glxinfo still shows llvmpipe
+      # after everything else. Leave it commented initially.
+      # - MESA_LOADER_DRIVER_OVERRIDE=d3d12
+      - DISPLAY=${DISPLAY}
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+      - PULSE_SERVER=${PULSE_SERVER}
+    devices:
+      - /dev/dxg:/dev/dxg
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:ro
+      - /mnt/wslg:/mnt/wslg:ro
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu]
+              capabilities: [gpu, graphics, display, compute, utility]

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ROS 2 build artifacts
+build/
+install/
+log/
+
+# Backups and pulled data - not part of the submission
+backup_erc_vision/
+backup_maps/
+pulled_maps/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Debug frames
+/tmp/erc_debug_frames/
